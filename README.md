@@ -47,6 +47,8 @@ Plus an automatic backup system that saves your conversation before context comp
 - **Session rotation** — Keeps last 5 sessions, auto-deletes older ones
 - **Per-project storage** — Each project maintains its own session history
 - **Extended memory** — Claude can reference transcripts without displaying them
+- **Smart project detection** — Works from any directory, auto-finds your projects
+- **Multi-project support** — Choose which project to load/save when multiple found
 
 ## Installation
 
@@ -94,6 +96,11 @@ Use before:
 - Switching to another project
 - When you want a checkpoint
 
+Save to specific project (when not in project directory):
+```
+/save-session /path/to/project
+```
+
 ### Loading Previous Session
 
 ```
@@ -105,9 +112,24 @@ Use when:
 - Returning to a project after a break
 - Need to recall what was discussed
 
+**Smart project detection:**
+- If in project directory → loads from that project
+- If not → searches `~/Work*`, `~/Projects`, `~/Dev`, `~/Code`
+- If multiple projects found → prompts you to choose
+
+Load from specific project:
+```
+/load-session /path/to/project
+```
+
 Load a specific session:
 ```
 /load-session 003
+```
+
+Load specific session from specific project:
+```
+/load-session /path/to/project 003
 ```
 
 ## Project Structure
