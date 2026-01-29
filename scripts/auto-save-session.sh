@@ -1,13 +1,70 @@
 #!/bin/bash
 # VibeBackUp — Auto-save clean conversation before compaction
 # Called by PreCompact hook
-# Extracts only user questions and assistant text responses (no tool calls, no thinking)
+# Extracts only user questions and assistant text responses
 
 set -euo pipefail
 
-PROJECT_DIR="${PWD}"
 TIMESTAMP=$(date "+%Y-%m-%d %H:%M")
 CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+DEBUG_LOG="/tmp/vibebackup-debug.log"
+
+# Log for debugging
+exec > >(tee -a "$DEBUG_LOG") 2>&1
+echo "=== VibeBackUp $(date) ==="
+
+# Check stdin
+STDIN_DATA=""
+if [ ! -t 0 ]; then
+    STDIN_DATA=$(cat)
+    echo "Stdin: $STDIN_DATA"
+fi
+
+# Try to get session ID from stdin
+SESSION_ID=$(echo "$STDIN_DATA" | jq -r '.sessionId // empty' 2>/dev/null || true)
+
+# Find transcript
+TRANSCRIPT_PATH=""
+if [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ] && [ "$SESSION_ID" != "" ]; then
+    TRANSCRIPT_PATH=$(find "$CLAUDE_PROJECTS_DIR" -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
+    echo "By session ID: $TRANSCRIPT_PATH"
+fi
+
+# Fallback: most recent transcript
+if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
+    if [ -d "$CLAUDE_PROJECTS_DIR" ]; then
+        TRANSCRIPT_PATH=$(find "$CLAUDE_PROJECTS_DIR" -name "*.jsonl" -type f -exec stat -f '%m %N' {} \; 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+    fi
+fi
+
+if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
+    echo "No transcript found"
+    exit 0
+fi
+
+echo "Transcript: $TRANSCRIPT_PATH"
+
+# Extract project directory - most frequent non-home cwd
+# Handle paths with spaces correctly
+HOME_LOWER=$(echo "$HOME" | tr '[:upper:]' '[:lower:]')
+PROJECT_DIR=$(jq -r 'if .cwd then .cwd else empty end' "$TRANSCRIPT_PATH" 2>/dev/null | while read -r line; do
+    line_lower=$(echo "$line" | tr '[:upper:]' '[:lower:]')
+    if [ "$line_lower" != "$HOME_LOWER" ] && [ -n "$line" ]; then
+        echo "$line"
+    fi
+done | sort | uniq -c | sort -rn | head -1 | sed 's/^[[:space:]]*[0-9]*[[:space:]]*//')
+
+# Fallback to last cwd
+if [ -z "$PROJECT_DIR" ]; then
+    PROJECT_DIR=$(jq -r 'if .cwd then .cwd else empty end' "$TRANSCRIPT_PATH" 2>/dev/null | tail -1)
+fi
+
+# Fallback to PWD
+if [ -z "$PROJECT_DIR" ] || [ "$PROJECT_DIR" = "null" ]; then
+    PROJECT_DIR="${PWD}"
+fi
+
+echo "Project: $PROJECT_DIR"
 
 # Ensure sessions directory exists
 mkdir -p "${PROJECT_DIR}/.claude/sessions"
@@ -24,59 +81,24 @@ fi
 
 SESSION_FILE="${PROJECT_DIR}/.claude/sessions/conversation-${NEXT_NUM}.md"
 
-# Find the most recent transcript
-# Claude stores transcripts in ~/.claude/projects/{encoded-path}/{uuid}.jsonl
-TRANSCRIPT_PATH=""
-
-# Try to find the most recent .jsonl file across all project folders
-if [ -d "$CLAUDE_PROJECTS_DIR" ]; then
-    TRANSCRIPT_PATH=$(find "$CLAUDE_PROJECTS_DIR" -name "*.jsonl" -type f -exec stat -f '%m %N' {} \; 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
-fi
-
-# Check if we found a transcript
-if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
-    cat > "$SESSION_FILE" << EOF
-# Session — ${TIMESTAMP} (auto-saved before compact)
-
-## Status
-Transcript not found. Manual /save-session recommended.
-
-## Searched
-- $CLAUDE_PROJECTS_DIR
-
----
-*Auto-saved by VibeBackUp PreCompact hook*
-EOF
-    echo "VibeBackUp: No transcript found, created marker at ${SESSION_FILE}"
-    exit 0
-fi
-
-# Extract clean conversation from JSONL transcript
-# - User messages: type="user", userType="external", extract .message (string)
-# - Assistant text: type="assistant", extract .message.content[] where type="text"
-# - Skip: tool_result messages, thinking, tool_use
-
+# Extract clean conversation
 {
     echo "# Session Conversation — ${TIMESTAMP}"
     echo ""
     echo "## Messages"
     echo ""
 
-    # Process each line of JSONL
     while IFS= read -r line; do
         msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
         user_type=$(echo "$line" | jq -r '.userType // empty' 2>/dev/null)
 
         if [ "$msg_type" = "user" ] && [ "$user_type" = "external" ]; then
-            # External user message - this is actual user input
-            # .message can be a string (simple message) or object with content array (tool results - skip those)
             msg_content=$(echo "$line" | jq -r '
                 if (.message | type) == "string" then
                     .message
                 elif (.message.content | type) == "string" then
                     .message.content
                 elif (.message.content | type) == "array" then
-                    # Check if it contains tool_result - skip if so
                     if (.message.content[0].type // "") == "tool_result" then
                         ""
                     else
@@ -95,7 +117,6 @@ fi
                 echo ""
             fi
         elif [ "$msg_type" = "assistant" ]; then
-            # Assistant message - extract only text content (skip thinking, tool_use)
             text_content=$(echo "$line" | jq -r '
                 if .message.content then
                     [.message.content[] | select(.type == "text") | .text] | join("\n\n")
@@ -121,13 +142,10 @@ fi
 
 } > "$SESSION_FILE"
 
-# Check if file has actual content (more than just headers)
 LINE_COUNT=$(wc -l < "$SESSION_FILE" | tr -d ' ')
-if [ "$LINE_COUNT" -lt 15 ]; then
-    echo "VibeBackUp: Warning - conversation file seems empty, transcript may have different format"
-fi
+echo "Saved $LINE_COUNT lines to $SESSION_FILE"
 
-# Rotate old sessions (keep max 5) - macOS compatible
+# Rotate (keep max 5)
 cd "${PROJECT_DIR}/.claude/sessions" 2>/dev/null || exit 0
 TOTAL=$(ls -1 conversation-*.md 2>/dev/null | wc -l | tr -d ' ')
 if [ "$TOTAL" -gt 5 ]; then
@@ -135,5 +153,4 @@ if [ "$TOTAL" -gt 5 ]; then
     ls -1 conversation-*.md 2>/dev/null | sort -V | head -n "$TO_DELETE" | xargs rm -f 2>/dev/null || true
 fi
 
-echo "VibeBackUp: Saved conversation to ${SESSION_FILE}"
-echo "VibeBackUp: Extracted from $(basename "$TRANSCRIPT_PATH")"
+echo "VibeBackUp: Done"
